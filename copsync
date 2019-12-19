@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+
+import argparse
+import datetime
+import getpass
+import logging
+import os
+import sys
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from ftplib import FTP
+from pathlib import Path
+
+import dateutil.parser
+
+log = logging.getLogger(__name__.split(".")[0])
+
+
+def get_username():
+    return input("Username: ")
+
+
+def get_password():
+    if sys.stdin.isatty():
+        return getpass.getpass("Password: ")
+    else:
+        return sys.stdin.readline().splitlines()[0]
+
+
+def get_options():
+    parser = argparse.ArgumentParser(description="Sync Copernicus data.")
+    parser.add_argument(
+        "data",
+        type=lambda x: x.lower(),
+        choices=["nrt", "dt"],
+        help="dataset to sync, nrt (near realtime) or dt (delayed time)",
+    )
+    parser.add_argument(
+        "--user",
+        "-u",
+        metavar="USER",
+        dest="username",
+        type=str,
+        help="copernicus username",
+    )
+    parser.add_argument(
+        "--password",
+        "-p",
+        metavar="PASSWORD",
+        dest="password",
+        type=str,
+        help="copernicus password",
+    )
+    parser.add_argument(
+        "--dest",
+        "-d",
+        default=Path(".").resolve(),
+        metavar="DEST",
+        dest="dest",
+        type=lambda x: Path(x).expanduser().resolve(),
+        help="destination directory",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        dest="verbosity",
+        default=0,
+        action="count",
+        help="increase verbosity, can be repeated twice",
+    )
+    parser.add_argument(
+        "--delay",
+        dest="delay",
+        metavar="N",
+        default=0,
+        type=int,
+        help="wait N seconds between files",
+    )
+
+    # parse options
+    options = parser.parse_args()
+
+    # get username and password interactively if not given
+    if options.username is None:
+        options.username = get_username()
+    if options.password is None:
+        options.password = get_password()
+
+    return options
+
+
+def configure_logging(level):
+    """Configure logging.
+
+    :param level:
+        The logging level, can be any of:
+            * :data:`DEBUG`
+            * :data:`INFO`
+            * :data:`WARNING`
+            * :data:`ERROR`
+            * :data:`CRITICAL`
+    """
+    for handler in log.handlers:
+        log.removeHandler(handler)
+
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s: %(message)s", datefmt="%d-%b-%y %H:%M:%S"
+    )
+    handler.setFormatter(formatter)
+    log.addHandler(handler)
+    log.setLevel(level)
+
+
+@dataclass
+class File:
+    path: Path
+    modified: datetime.datetime
+    size: int
+
+
+class Sync(ABC):
+    def __init__(self, host, path, username, password, destination, delay=0):
+        self.ftp = FTP(host, user=username, passwd=password)
+        try:
+            self.ftp.cwd(path)
+        except Exception as err:
+            self.ftp.close()
+            raise err
+        self.destination = destination
+        self.destination.mkdir(parents=True, exist_ok=True)
+        self.delay = delay
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.ftp.close()
+
+    @property
+    @abstractmethod
+    def prefix(self):
+        pass
+
+    def sync(self):
+        # get file indices
+        ftp_files = self.index_ftp_files()
+        local_files = self.index_local_files()
+
+        # get list of dates
+        dates = sorted(list(set(ftp_files.keys()) | set(local_files.keys())))
+
+        # loop over all dates
+        for date in dates:
+            ftp_file = ftp_files.get(date)
+            local_file = local_files.get(date)
+
+            # get local path
+            local_path = (
+                self.destination
+                / f"{date.year:04d}"
+                / f"{self.prefix}{date.strftime('%Y%m%d')}.nc"
+            )
+
+            # local file exists without matching remote file
+            if ftp_file is None:
+                log.info(f"deleting {local_path}")
+                local_file.unlink()
+
+            elif local_file is None:
+                log.info(f"new file {local_path}")
+                self.download_file(ftp_file, local_path)
+
+            elif (
+                local_file.modified != ftp_file.modified
+                or local_file.size != ftp_file.size
+            ):
+                log.info(f"updating {local_path}")
+                self.download_file(ftp_file, local_path)
+            else:
+                log.debug(f"skipping existing file {local_path}")
+
+    def download_file(self, source, dest):
+        try:
+
+            # slow downloads, to be nice
+            time.sleep(self.delay)
+
+            # save the file
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest, "wb") as target:
+                self.ftp.retrbinary(f"RETR {source.path}", target.write)
+
+            # set local modification time to remote modification time
+            os.utime(dest, (dest.stat().st_atime, source.modified.timestamp()))
+
+        except BaseException as err:
+            try:
+                dest.unlink()
+            except FileNotFoundError:
+                pass
+            raise err
+
+    @abstractmethod
+    def index_ftp_files(self):
+        pass
+
+    def index_local_files(self):
+        files = {}
+        prefix_len = len(self.prefix)
+        for path in self.destination.iterdir():
+            if path.is_dir() and path.name.isnumeric() and len(path.name) == 4:
+                for file in path.iterdir():
+                    if file.is_file() and file.name[:prefix_len] == self.prefix:
+                        name = file.name
+                        date = dateutil.parser.parse(name[prefix_len : prefix_len + 8])
+                        modified = datetime.datetime.fromtimestamp(
+                            int(file.stat().st_mtime)
+                        )
+                        size = file.stat().st_size
+                        files[date] = File(file, modified, size)
+        return files
+
+    def list_ftp_files(self, path):
+        prefix_len = len(self.prefix)
+        lines = []
+        self.ftp.dir(str(path), lines.append)
+        for line in lines:
+            fields = line.split()
+            name = fields[-1]
+            if fields[0][0] == "-" and name[:prefix_len] == self.prefix:
+                modified = dateutil.parser.parse(" ".join(fields[5:-1]))
+                date = dateutil.parser.parse(name[prefix_len : prefix_len + 8])
+                size = int(fields[4])
+                yield date, File(Path(path / name), modified, size)
+
+    def ftp_years(self):
+        for path in self.ftp.nlst():
+            if path.isnumeric() and len(path) == 4:
+                yield int(path)
+
+
+class SyncNRT(Sync):
+    def __init__(self, username, password, destination, delay=0):
+        super().__init__(
+            "nrt.cmems-du.eu",
+            "/Core/SEALEVEL_GLO_PHY_L4_NRT_OBSERVATIONS_008_046/"
+            "dataset-duacs-nrt-global-merged-allsat-phy-l4",
+            username,
+            password,
+            destination,
+            delay,
+        )
+
+    @property
+    def prefix(self):
+        return "nrt_global_allsat_phy_l4_"
+
+    def index_ftp_files(self):
+        files = {}
+        for year in self.ftp_years():
+            for month in self.ftp_months(year):
+                log.info(f"checking {year:04d}/{month:02d}")
+                for date, file in self.list_ftp_files(Path(f"{year:04d}/{month:02d}")):
+                    files[date] = file
+        return files
+
+    def ftp_months(self, year):
+        for path in [p.split("/")[1] for p in self.ftp.nlst(f"{year:04d}")]:
+            if path.isnumeric() and len(path) == 2:
+                yield int(path)
+
+
+class SyncDT(Sync):
+    def __init__(self, username, password, destination, delay=0):
+        super().__init__(
+            "my.cmems-du.eu",
+            "/Core/SEALEVEL_GLO_PHY_L4_REP_OBSERVATIONS_008_047/"
+            "dataset-duacs-rep-global-merged-allsat-phy-l4",
+            username,
+            password,
+            destination,
+            delay,
+        )
+
+    @property
+    def prefix(self):
+        return "dt_global_allsat_phy_l4_"
+
+    def index_ftp_files(self):
+        files = {}
+        for year in self.ftp_years():
+            log.info(f"checking {year:04d}")
+            for date, file in self.list_ftp_files(Path(f"{year:04d}")):
+                files[date] = file
+        return files
+
+
+def main(options):
+
+    # configure logging
+    if options.verbosity == 0:
+        configure_logging(logging.WARNING)
+    elif options.verbosity == 1:
+        configure_logging(logging.INFO)
+    else:
+        configure_logging(logging.DEBUG)
+
+    # select proper sync class
+    if options.data == "nrt":
+        sync = SyncNRT
+    else:
+        sync = SyncDT
+
+    # sync data
+    with sync(options.username, options.password, options.dest, options.delay) as s:
+        s.sync()
+
+
+if __name__ == "__main__":
+    try:
+        main(get_options())
+    except KeyboardInterrupt:
+        pass
