@@ -6,7 +6,7 @@ Sync Copernicus (formally AVISO) SSH data.
 Requirements
 ------------
 
-* Python 3.6+
+* Python 3.7+
 * python-dateutil
 
 
